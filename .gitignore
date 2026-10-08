@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+runs/
+data/
+*.pth
+*.npy
+*.tif
+*.tiff
+*.log
+.vscode/
+.idea/
