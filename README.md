@@ -1,184 +1,220 @@
-# geedl
+# Multi-sensor canopy height estimation
 
-Download Google Earth Engine images and collections locally via Google Drive.
+Deep-learning estimation of canopy height (CHM, in metres) from **Sentinel-2**
+optical imagery fused with **Sentinel-1** (C-band SAR), **ALOS PALSAR** (L-band
+SAR) and a **digital elevation model**, each ingested at its native resolution.
+The network is trained against LiDAR-derived canopy height models and predicts
+a 10 m CHM on the Sentinel-2 grid.
 
-**geedl** solves the problem of downloading large GEE datasets that exceed Google Drive storage limits by automatically managing the download pipeline: submitting export tasks in batches, monitoring their progress, downloading completed files, and deleting them from Drive to make room for more.
+The repository contains the training and inference code only; patch
+extraction and evaluation are left to the user (see
+[Data preparation](#data-preparation) for the expected format).
 
-## Features
+## How it works
 
-- Download any GEE image or image collection with a single command
-- Auto-detects asset type (Image vs ImageCollection)
-- Uses native resolution by default (no need to specify scale)
-- Automatic tile-based processing for large regions
-- Resume support for crash recovery
-- Parallel downloads with configurable workers (default: 8)
-- ROI filtering with any geospatial file format
-- Date, band, and metadata filtering for collections
-- Post-completion monitoring to catch straggler files
-- **Direct download** for small tiles (bypasses Drive entirely via `getDownloadURL()`)
-- **Storage-aware pipeline** that pauses task submission when Drive is running low
-- **Adaptive concurrency** that auto-tunes to your GEE quota limits
-- **EECU usage tracking** with configurable warnings
-- **Google Cloud Storage export** as alternative to Drive (optional)
+```
+Sentinel-2  (10 bands @ 10 m, 256 px) --> BPAT-UNet    --\
+ALOS PALSAR (HH, HV  @ 25 m, 102 px) --> light U-Net  --\  gated     regression
+Sentinel-1  (VV, VH  @ 10 m, 256 px) --> light U-Net  --/  fusion --> head --> CHM (m)
+DEM         (1 band  @ 30 m,  85 px) --> light U-Net  --/
+```
+
+* **One branch per sensor.** The Sentinel-2 branch is a BPAT-UNet
+  (boundary-preserving U-Net, simplified for regression): the input bands
+  are projected to 4 channels by a 1x1 convolution, then a 5-level U-Net
+  (64 to 1024 channels) applies a boundary-enhancement module after every
+  down-sampling stage and channel attention at 1/4 and 1/8 resolution. It is
+  trained from scratch. `--s2_arch unet` replaces it with a U-Net with an
+  ImageNet ResNet-50 encoder from
+  [segmentation_models_pytorch](https://github.com/qubvel-org/segmentation_models.pytorch).
+  Every auxiliary sensor gets a light U-Net whose depth is chosen
+  automatically from the patch size, so a 102 px ALOS patch is not
+  down-sampled into nothing. Each branch outputs 64 feature maps.
+* **No input resampling.** Every patch enters the network on its own grid.
+  The feature maps of the auxiliary branches are bilinearly resampled to the
+  Sentinel-2 grid *inside* the network, right before fusion.
+* **Gated fusion.** A global descriptor of all branches drives a small MLP
+  that produces one gate per channel and per sensor; the gated features are
+  concatenated and refined by a 3x3 convolution. The gates are logged during
+  training, which tells you how much each sensor is actually being used.
+* **Regression head.** Two 3x3 convolutions and a 1x1 output. A sigmoid maps
+  the output to [0, 1]; multiplying by `--chm_max` (default 100 m) gives
+  metres.
+* **Loss.** Mean absolute error. Pixels whose reference CHM is exactly 0 are
+  excluded from the loss when they cover at least 5 % of the patch, because 0
+  is the LiDAR no-data value (a few isolated zeros are real open ground and
+  are kept).
+
+Any subset of the auxiliary sensors can be used: a branch exists only if its
+folder is passed to `train.py`, so the same code trains the S2-only,
+S2 + S1, S2 + S1 + ALOS, ... ablations.
+
+## Repository layout
+
+| File | Purpose |
+|------|---------|
+| `model.py` | Network definition, normalisation helpers, checkpoint loading. Shared by the two scripts. |
+| `train.py` | Pairs the patches, computes the normalisation statistics, trains with early stopping, writes `best.pth` / `last.pth`. |
+| `predict.py` | Rebuilds the network from a checkpoint and writes one CHM raster per input patch. |
+| `requirements.txt` | Python dependencies. |
 
 ## Installation
 
 ```bash
-pip install geedl
-
-# With Google Cloud Storage support (optional)
-pip install geedl[gcs]
+git clone <this repository>
+cd <this repository>
+pip install -r requirements.txt
 ```
 
-## Quick Start
+PyTorch with CUDA support is strongly recommended for training (the full
+model has ~52 M parameters). Follow the [PyTorch instructions](https://pytorch.org/get-started/locally/)
+for your platform if `pip install torch` does not pick a GPU build.
 
-### Authentication Setup
+## Data preparation
 
-1. Create a Google Cloud project and enable:
-   - Earth Engine API
-   - Google Drive API
-   - Cloud Resource Manager API
+Patches are stored as one file per patch and per modality, **paired by file
+name**: `S2/patch_0001.npy`, `CHM/patch_0001.npy`, `S1/patch_0001.npy`, ...
 
-2. Create OAuth2 credentials (Desktop application) and download as JSON
+```
+data/
+  train/
+    S2/    patch_0001.npy  (C, 256, 256)   Sentinel-2 reflectance x 10000
+    CHM/   patch_0001.npy  (256, 256)      LiDAR canopy height in metres, 0 = no data
+    S1/    patch_0001.npy  (2, 256, 256)   Sentinel-1 VV, VH (dB)            optional
+    ALOS/  patch_0001.npy  (2, 102, 102)   ALOS PALSAR HH, HV (dB)           optional
+    DEM/   patch_0001.npy  (1, 85, 85)     elevation in metres               optional
+  test/
+    S2/    patch_0101.tif  ...             GeoTIFF (or .npy) with the same layout
+    S1/, ALOS/, DEM/
+```
 
-3. Run authentication:
+* Training patches are `.npy` arrays. Inference patches can be GeoTIFF (the
+  output is then a georeferenced GeoTIFF) or `.npy`.
+* All patches of one sample cover the **same ground footprint**, each at the
+  sensor's native resolution: `side = 256 x 10 m / sensor resolution`
+  (ALOS at 25 m -> 102 px, DEM at 30 m -> 85 px). `train.py` warns when a
+  folder does not match the resolutions passed on the command line.
+* Sentinel-2 bands are divided by `--s2_divisor` (10000 for reflectance
+  stored as integers). The published models use the ten bands
+  B2, B3, B4, B5, B6, B7, B8, B8A, B11, B12.
+* Sentinel-1 and ALOS patches are scaled per band with the min/max computed
+  over the training patches (any unit works, dB is what the published models
+  used). The DEM is divided by a fixed `--dem_divisor` (2100 m by default).
+  All statistics are stored in the checkpoint, so inference normalises
+  exactly like training.
+* The train/validation split is a seeded random split of the patch list.
+  Make sure the training patches do not overlap, otherwise the validation
+  loss is optimistic.
+
+## Training
+
 ```bash
-geedl auth --credentials /path/to/credentials.json --test
+# all four sensors
+python train.py \
+    --s2_dir data/train/S2 --chm_dir data/train/CHM \
+    --s1_dir data/train/S1 --alos_dir data/train/ALOS --dem_dir data/train/DEM \
+    --output_dir runs/s2_s1_alos_dem
+
+# Sentinel-2 + Sentinel-1 only (just drop the folders you do not have)
+python train.py --s2_dir data/train/S2 --chm_dir data/train/CHM \
+    --s1_dir data/train/S1 --output_dir runs/s2_s1
+
+# fine-tune a previous run on more data with a smaller learning rate
+python train.py ... --init_from_checkpoint runs/s2_s1_alos_dem/best.pth --lr 1e-4
 ```
 
-### Download Examples
+`--output_dir` receives:
+
+| File | Content |
+|------|---------|
+| `best.pth` | weights of the epoch with the lowest validation MAE (use this one) |
+| `last.pth` | weights of the last epoch; training resumes from it automatically if you re-run the same command |
+| `config.json` | architecture + normalisation statistics (also embedded in the checkpoints) |
+| `train.log` | per-iteration loss, learning rate, fusion gates, validation MAE |
+| `figures/` | one PNG per epoch with inputs, reference and prediction for a few patches |
+
+Main options (`python train.py --help` lists them all):
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `--epochs` / `--patience` | 1000 / 25 | upper bound on epochs; stop after 25 epochs without validation improvement |
+| `--batch_size` | 15 | fits a 12 GB GPU with four branches at 256 px |
+| `--lr`, `--final_lr`, `--warmup_epochs`, `--lr_decay_epochs` | 1e-3, 1e-4, 5, 60 | linear warm-up, cosine decay to `--final_lr` at epoch 60, then constant |
+| `--chm_max` | 100 | CHM normalisation (metres); predictions saturate at this height |
+| `--s2_resolution`, `--s1_resolution`, `--alos_resolution`, `--dem_resolution` | 10, 10, 25, 30 | native resolutions, used to check the patch sizes |
+| `--augment` | off | random flips and 90-degree rotations |
+| `--keep_zero_chm` | off | also supervise pixels with CHM == 0 |
+| `--s2_arch` | bpatunet | Sentinel-2 branch: `bpatunet` or `unet` (smp U-Net with an ImageNet encoder) |
+| `--s2_base_channels` | 64 | base width of the BPAT-UNet |
+| `--encoder_name` | resnet50 | encoder of the `unet` branch, any encoder supported by segmentation_models_pytorch |
+
+The S2 patch side must be a multiple of 16.
+
+## Inference
 
 ```bash
-# Download SRTM elevation (auto-detected as Image, uses native 30m resolution)
-geedl download USGS/SRTMGL1_003 -o ./output
-
-# Download Sentinel-1 collection with filters
-geedl download COPERNICUS/S1_GRD -o ./output \
-    --start-date 2023-01-01 --end-date 2023-12-31 \
-    --bands VV VH \
-    --filter instrumentMode eq IW
-
-# Download with ROI and custom resolution
-geedl download LANDSAT/LC08/C02/T1_L2 -o ./output \
-    --roi region.shp --scale 30 --resume
-
-# Download PALSAR data for a bounding box
-geedl download JAXA/ALOS/PALSAR/YEARLY/SAR_EPOCH -o ./output \
-    --bounds -70 -10 -60 0 \
-    --start-date 2020-01-01
-
-# Direct download (bypass Drive for small tiles)
-geedl download USGS/SRTMGL1_003 -o ./output \
-    --download-method direct --bounds -70 -10 -69 -9
-
-# Export to Google Cloud Storage instead of Drive
-geedl download COPERNICUS/S1_GRD -o ./output \
-    --export-target gcs --gcs-bucket my-bucket \
-    --start-date 2023-01-01 --end-date 2023-12-31
-
-# Time interval processing (yearly subdirectories)
-geedl download COPERNICUS/S1_GRD -o ./output \
-    --start-date 2020-01-01 --end-date 2023-12-31 \
-    --interval 1 --interval-unit years
+python predict.py --checkpoint runs/s2_s1_alos_dem/best.pth \
+    --s2_dir data/test/S2 --s1_dir data/test/S1 --alos_dir data/test/ALOS --dem_dir data/test/DEM \
+    --output_dir runs/s2_s1_alos_dem/predictions
 ```
 
-### Python API
+* Only the folders of the sensors the model was trained with are needed; the
+  checkpoint knows which ones.
+* One raster per Sentinel-2 patch is written with the same file stem:
+  float32 GeoTIFF in metres (georeferencing copied from the input), or
+  `--uint16` for a compact uint16 GeoTIFF scaled by 1000.
+* Patches already present in `--output_dir` are skipped (`--overwrite` to
+  recompute), so an interrupted run can simply be restarted.
+* Patches smaller than the training size are reflect-padded and cropped back;
+  larger patches are processed whole (the network is fully convolutional).
+
+## Checkpoints
+
+A checkpoint is a `torch.save` dictionary with `state_dict`, `optimizer`,
+`epoch`, `best_mae` and `config`. `config` is all `predict.py` needs:
+
+```json
+{
+  "s2_arch": "bpatunet", "s2_base_channels": 64, "encoder_name": "resnet50",
+  "feature_channels": 64, "head_channels": 64,
+  "patch_size": 256, "chm_max": 100.0,
+  "s2": {"channels": 10, "resolution_m": 10.0, "divisor": 10000.0},
+  "sensors": [
+    {"name": "ALOS", "channels": 2, "resolution_m": 25.0, "patch_side": 102,
+     "base_channels": 32, "depth": 1, "min_per_band": [...], "max_per_band": [...]},
+    {"name": "S1", ...}, {"name": "DEM", ...}
+  ]
+}
+```
+
+A config without `s2_arch` is read as `"unet"`, so checkpoints trained with
+the smp U-Net branch keep loading.
+
+To use a checkpoint from Python:
 
 ```python
-from geedl import GEEDownloader
-
-downloader = GEEDownloader(
-    output_dir="./output",
-    max_concurrent_tasks=10,
-    download_workers=8,
-)
-
-# Download any asset (auto-detects type, uses native resolution)
-downloader.download(
-    asset_id="COPERNICUS/S1_GRD",
-    start_date="2023-01-01",
-    end_date="2023-12-31",
-    roi_file="region.shp",
-    bands=["VV", "VH"],
-    filters=[
-        ("instrumentMode", "eq", "IW"),
-    ],
-    resume=True,
-)
+from model import load_model
+model, config, _ = load_model("runs/s2_s1_alos_dem/best.pth", "cuda")
 ```
 
-## How It Works
+## Citation
 
-1. **Account Diagnostics**: Queries actual Drive storage and GEE task status at startup
-2. **Asset Detection**: Automatically determines if the asset is an Image or ImageCollection
-3. **Native Resolution**: Reads the asset's native scale (no guessing required)
-4. **Tile Generation**: Large regions are divided into manageable tiles
-5. **Smart Routing**: Small tiles are downloaded directly via `getDownloadURL()` (bypasses Drive); larger tiles go through the batch export pipeline
-6. **Storage-Aware Submission**: Monitors Drive usage and pauses task submission when approaching the headroom threshold
-7. **Adaptive Concurrency**: Auto-tunes the number of concurrent GEE tasks based on queue behavior
-8. **Task Submission**: Export tasks are submitted to GEE (or GCS) with rate limiting
-9. **Status Monitoring**: Monitors task completion with EECU usage tracking
-10. **Parallel Downloads**: Completed files are downloaded in parallel, largest first to reclaim Drive space faster
-11. **Cleanup**: Files are deleted from Drive/GCS after successful download
-12. **Post-completion Wait**: Continues checking for straggler files (default: 30 minutes)
+If you use this code, please cite:
 
-## Download Methods
-
-### Drive (default)
-The standard pipeline: GEE exports to Drive, geedl downloads and deletes. Works for any file size but constrained by Drive storage (15 GB free).
-
-### Direct
-Uses `ee.Image.getDownloadURL()` to stream tiles directly from GEE to local disk. No Drive storage used. Best for tiles under ~32 MB. Uses interactive EECU quota (separate from batch).
-
-### Auto (recommended)
-Estimates tile size and automatically chooses direct download for small tiles, Drive export for large ones. Set with `--download-method auto` (the default).
-
-## Export Targets
-
-### Google Drive (default)
-No extra setup required. geedl monitors Drive storage and pauses submissions to avoid exceeding your account limit.
-
-### Google Cloud Storage
-For users with a GCP project. Removes the 15 GB Drive constraint. The GCS free tier offers 5 GB storage + 100 GB/month outbound transfer.
-
-```bash
-pip install geedl[gcs]
-geedl download ASSET_ID -o ./output --export-target gcs --gcs-bucket my-bucket
+```bibtex
+@article{ferreira_chm_multisensor,
+  title   = {<paper title>},
+  author  = {Ferreira, Matheus P. and ...},
+  journal = {<journal>},
+  year    = {<year>},
+  doi     = {<doi>}
+}
 ```
-
-## Performance Tuning
-
-| Parameter | Default | Flag | Notes |
-|-----------|---------|------|-------|
-| Download workers | 8 | `--workers` | Increase for fast connections |
-| Download chunk size | 50 MB | `--chunk-size` | Larger = fewer HTTP round-trips |
-| Max concurrent tasks | 10 | `--max-tasks` | Auto-tunes down if GEE queues tasks |
-| Submission delay | 2.0s | `--submission-delay` | Between GEE task submissions |
-| Check interval | 30s | `--check-interval` | Between status checks |
-| File dimensions | 2560x2560 | `--file-dimensions` | Export tile size in pixels |
-| Direct threshold | 32 MB | `--direct-threshold` | Max size for direct download |
-| Storage headroom | 15% | `--storage-headroom` | Min free Drive space (% of limit) |
-| EECU warning | 100h | `--eecu-warn` | Warn at this session EECU usage |
-| Post-completion wait | 1800s | `--post-wait` | Wait for straggler files |
-
-## GEE Quota Notes
-
-As of April 2026, noncommercial GEE projects use tiered EECU quotas:
-
-| Tier | Monthly EECU-Hours | Concurrent Batch Tasks |
-|------|-------------------|----------------------|
-| Community (default) | 150 | ~2 |
-| Contributor | 1,000 | ~8 |
-| Partner | 100,000 | ~20+ |
-
-geedl's adaptive concurrency automatically adjusts to your account's limits. If tasks stay queued (READY state) for too long, it reduces the concurrency cap. If all tasks are running, it gradually increases it.
-
-## Configuration
-
-Default configuration directory: `~/.geedl/`
-- `credentials.json` - OAuth2 credentials from Google Cloud Console
-- `token.json` - Cached authentication token (auto-generated)
 
 ## License
 
-MIT
+<add a license, e.g. MIT or Apache-2.0>
+
+## Contact
+
+Matheus Pinheiro Ferreira -- mpferreira@usp.br
