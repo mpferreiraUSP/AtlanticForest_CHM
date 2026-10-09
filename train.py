@@ -44,7 +44,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from model import (SENSOR_CONFIG_KEYS, auto_backbone_depth, build_model,
+from model import (S2_ARCHS, SENSOR_CONFIG_KEYS, auto_backbone_depth, build_model,
                    normalize_s2, normalize_sensor)
 
 # Auxiliary branches: (name, CLI folder argument, CLI resolution argument).
@@ -82,8 +82,14 @@ def parse_args():
     p.add_argument("--workers", type=int, default=8, help="DataLoader workers.")
     p.add_argument("--seed", type=int, default=31)
     # -- model ----------------------------------------------------------------
-    p.add_argument("--encoder_name", default="resnet50", help="Encoder of the Sentinel-2 U-Net (any smp encoder).")
-    p.add_argument("--no_pretrained", action="store_true", help="Do not initialise the S2 encoder with ImageNet weights.")
+    p.add_argument("--s2_arch", default="bpatunet", choices=S2_ARCHS,
+                   help="Sentinel-2 branch: 'bpatunet' (BPAT-UNet, from scratch) or 'unet' "
+                        "(smp U-Net with an ImageNet encoder, see --encoder_name).")
+    p.add_argument("--s2_base_channels", type=int, default=64, help="Base width of the BPAT-UNet.")
+    p.add_argument("--encoder_name", default="resnet50",
+                   help="Encoder of the S2 U-Net (any smp encoder); only with --s2_arch unet.")
+    p.add_argument("--no_pretrained", action="store_true",
+                   help="Do not initialise the S2 encoder with ImageNet weights (--s2_arch unet only).")
     p.add_argument("--feature_channels", type=int, default=64, help="Feature maps produced by every branch.")
     p.add_argument("--head_channels", type=int, default=64, help="Width of the regression head.")
     p.add_argument("--sensor_base_channels", type=int, default=32, help="Base width of the auxiliary branches.")
@@ -371,6 +377,8 @@ def main():
     s2_probe = np.load(train_samples[0]["S2"])
     s2_channels, patch_size = int(s2_probe.shape[0]), int(s2_probe.shape[-1])
     log.info(f"S2: {s2_channels} bands, {patch_size}x{patch_size} px @ {args.s2_resolution:g} m")
+    if patch_size % 16:
+        raise SystemExit(f"S2 patch side must be a multiple of 16 (4 down-sampling stages), got {patch_size}")
     for s in sensors:
         probe = np.load(train_samples[0][s["name"]])
         probe = probe[None] if probe.ndim == 2 else probe
@@ -391,6 +399,8 @@ def main():
                  f"max {np.round(s['max_per_band'], 3).tolist()}")
 
     config = dict(
+        s2_arch=args.s2_arch,
+        s2_base_channels=args.s2_base_channels,
         encoder_name=args.encoder_name,
         feature_channels=args.feature_channels,
         head_channels=args.head_channels,
@@ -413,7 +423,9 @@ def main():
 
     # -- model / optimiser ------------------------------------------------------
     model = build_model(config, pretrained=not args.no_pretrained).to(device)
-    log.info(f"model: {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M parameters")
+    log.info(f"model: S2 branch {args.s2_arch}"
+             + (f" ({args.encoder_name})" if args.s2_arch == "unet" else "")
+             + f" | {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M parameters")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     lr_schedule = build_lr_schedule(args, len(train_loader))
     torch.backends.cudnn.benchmark = True
