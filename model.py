@@ -4,7 +4,7 @@ Network definition shared by ``train.py`` and ``predict.py``.
 Late-fusion network for canopy height model (CHM) regression, one branch per
 sensor, each branch ingesting its patch at the sensor's NATIVE resolution::
 
-    Sentinel-2  (10 bands @ 10 m)  -> U-Net, ResNet-50 encoder (ImageNet init) \
+    Sentinel-2  (10 bands @ 10 m)  -> BPAT-UNet (BPATUNet)                      \
     ALOS PALSAR (HH, HV  @ 25 m)   -> light U-Net (SensorBackbone)              \  gated
     Sentinel-1  (VV, VH  @ 10 m)   -> light U-Net (SensorBackbone)              /  fusion -> head -> CHM
     DEM         (1 band  @ 30 m)   -> light U-Net (SensorBackbone)             /
@@ -17,6 +17,8 @@ The network returns a logit map; the caller applies a sigmoid and multiplies by
 Module/attribute names (``backbones``, ``fusion``, ``reg_head``, ``inc``,
 ``downs`` ...) are kept identical to the original research code so that
 checkpoints trained with it load unchanged (see ``config_from_checkpoint``).
+Checkpoints whose S2 branch is the smp U-Net (``config["s2_arch"] == "unet"``,
+which includes every checkpoint of the research code) are rebuilt with it.
 """
 import numpy as np
 import segmentation_models_pytorch as smp
@@ -155,19 +157,163 @@ class GatedFusion(nn.Module):
                 for i in range(self.n)]
 
 
-def build_s2_backbone(in_channels, out_channels, encoder_name="resnet50", pretrained=True):
-    """Sentinel-2 branch: U-Net with a ResNet-50 encoder (4 stages, 1/16),
-    wide decoder and scSE attention, returning ``out_channels`` feature maps."""
-    return smp.Unet(
-        encoder_name=encoder_name,
-        encoder_weights="imagenet" if pretrained else None,
-        in_channels=in_channels,
-        classes=out_channels,
-        activation=None,
-        encoder_depth=4,
-        decoder_channels=(512, 256, 128, 64),
-        decoder_attention_type="scse",
-    )
+# ---------------------------------------------------------------------------
+# BPAT-UNet (Sentinel-2 branch)
+# ---------------------------------------------------------------------------
+class BandAdaptationLayer(nn.Module):
+    """1x1 convolution projecting ``in_channels`` bands to ``target_channels``
+    (identity when they already match)."""
+
+    def __init__(self, in_channels, target_channels=4):
+        super().__init__()
+        if in_channels != target_channels:
+            self.adapt = nn.Conv2d(in_channels, target_channels, kernel_size=1)
+            nn.init.kaiming_normal_(self.adapt.weight, mode="fan_out", nonlinearity="relu")
+            nn.init.constant_(self.adapt.bias, 0)
+        else:
+            self.adapt = None
+
+    def forward(self, x):
+        return self.adapt(x) if self.adapt is not None else x
+
+
+class BoundaryEnhancementModule(nn.Module):
+    """Predicts a soft boundary map (depth-wise 3x3 -> 1x1 -> sigmoid) and adds
+    refined features where it is high: ``x + enhance(x) * boundary``."""
+
+    def __init__(self, channels):
+        super().__init__()
+        self.edge_conv = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, 1, kernel_size=1),
+        )
+        self.enhance = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        boundary = torch.sigmoid(self.edge_conv(x))
+        return x + self.enhance(x) * boundary
+
+
+class ChannelAttention(nn.Module):
+    """CBAM-style channel attention (shared MLP over average and max pooling)."""
+
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, channels // reduction, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, 1, bias=False),
+        )
+
+    def forward(self, x):
+        return x * torch.sigmoid(self.fc(self.avg_pool(x)) + self.fc(self.max_pool(x)))
+
+
+class Down(nn.Module):
+    """Max-pool 2x then DoubleConv."""
+
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.maxpool_conv = nn.Sequential(nn.MaxPool2d(2), DoubleConv(in_channels, out_channels))
+
+    def forward(self, x):
+        return self.maxpool_conv(x)
+
+
+class Up(nn.Module):
+    """Transposed-conv 2x, concatenate the skip connection, DoubleConv."""
+
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
+        self.conv = DoubleConv(in_channels, out_channels)
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        dy, dx = skip.size(2) - x.size(2), skip.size(3) - x.size(3)
+        x = F.pad(x, [dx // 2, dx - dx // 2, dy // 2, dy - dy // 2])
+        return self.conv(torch.cat([skip, x], dim=1))
+
+
+class BPATUNet(nn.Module):
+    """BPAT-UNet (Boundary Preserving Assembled Transformer U-Net), simplified
+    for dense regression, used as the Sentinel-2 branch.
+
+    Input bands are projected to 4 channels (1x1 conv), then a 5-level U-Net
+    (``base_channels`` x 1, 2, 4, 8, 16) with a boundary-enhancement module
+    after every down-sampling stage and channel attention at 1/4 and 1/8.
+    Returns ``out_channels`` maps at the input resolution; the input side must
+    be a multiple of 16.
+    """
+
+    def __init__(self, in_channels, out_channels=64, base_channels=64):
+        super().__init__()
+        bc = base_channels
+        self.band_adapt = BandAdaptationLayer(in_channels, target_channels=4)
+        self.inc = DoubleConv(4, bc)
+        self.down1 = Down(bc, bc * 2)
+        self.down2 = Down(bc * 2, bc * 4)
+        self.down3 = Down(bc * 4, bc * 8)
+        self.down4 = Down(bc * 8, bc * 16)
+        self.boundary_enhance_2 = BoundaryEnhancementModule(bc * 2)
+        self.boundary_enhance_3 = BoundaryEnhancementModule(bc * 4)
+        self.boundary_enhance_4 = BoundaryEnhancementModule(bc * 8)
+        self.boundary_enhance_5 = BoundaryEnhancementModule(bc * 16)
+        self.channel_att_3 = ChannelAttention(bc * 4)
+        self.channel_att_4 = ChannelAttention(bc * 8)
+        self.up1 = Up(bc * 16, bc * 8)
+        self.up2 = Up(bc * 8, bc * 4)
+        self.up3 = Up(bc * 4, bc * 2)
+        self.up4 = Up(bc * 2, bc)
+        self.outc = nn.Conv2d(bc, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        x1 = self.inc(self.band_adapt(x))
+        x2 = self.boundary_enhance_2(self.down1(x1))
+        x3 = self.channel_att_3(self.boundary_enhance_3(self.down2(x2)))
+        x4 = self.channel_att_4(self.boundary_enhance_4(self.down3(x3)))
+        x5 = self.boundary_enhance_5(self.down4(x4))
+        x = self.up1(x5, x4)
+        x = self.up2(x, x3)
+        x = self.up3(x, x2)
+        x = self.up4(x, x1)
+        return self.outc(x)
+
+
+S2_ARCHS = ("bpatunet", "unet")
+
+
+def build_s2_backbone(in_channels, out_channels, arch="bpatunet", encoder_name="resnet50",
+                      pretrained=True, base_channels=64):
+    """Sentinel-2 branch returning ``out_channels`` feature maps.
+
+    ``arch="bpatunet"`` (default): ``BPATUNet``, trained from scratch.
+    ``arch="unet"``: smp U-Net with an ImageNet ``encoder_name`` encoder
+    (4 stages, wide decoder, scSE), kept so that checkpoints trained with it
+    still load. ``encoder_name``/``pretrained`` only apply to it.
+    """
+    if arch == "bpatunet":
+        return BPATUNet(in_channels, out_channels, base_channels)
+    if arch == "unet":
+        return smp.Unet(
+            encoder_name=encoder_name,
+            encoder_weights="imagenet" if pretrained else None,
+            in_channels=in_channels,
+            classes=out_channels,
+            activation=None,
+            encoder_depth=4,
+            decoder_channels=(512, 256, 128, 64),
+            decoder_attention_type="scse",
+        )
+    raise ValueError(f"unknown S2 architecture {arch!r}; choose from {S2_ARCHS}")
 
 
 class MultiSensorCHMNet(nn.Module):
@@ -224,8 +370,12 @@ def build_model(config, pretrained=False):
     """Instantiate the network described by ``config`` (see train.py for the
     layout). ``pretrained`` only matters when training from scratch."""
     feat = int(config["feature_channels"])
+    # configs written before "s2_arch" existed all used the smp U-Net
     backbones = [build_s2_backbone(int(config["s2"]["channels"]), feat,
-                                   config.get("encoder_name", "resnet50"), pretrained)]
+                                   arch=config.get("s2_arch", "unet"),
+                                   encoder_name=config.get("encoder_name", "resnet50"),
+                                   pretrained=pretrained,
+                                   base_channels=int(config.get("s2_base_channels", 64)))]
     for s in config["sensors"]:
         backbones.append(SensorBackbone(int(s["channels"]), feat,
                                         int(s["base_channels"]), int(s["depth"])))
@@ -265,6 +415,9 @@ def config_from_checkpoint(ck):
     chm_max = ck["max_chm_value"]
     chm_max = float(chm_max[0] if isinstance(chm_max, (list, tuple)) else chm_max)
     return dict(
+        # in fusion mode the research code always built the S2 branch as an
+        # smp U-Net ("--arch BPATUNet" fell back to it)
+        s2_arch="unet",
         # the legacy checkpoint stores the S2 encoder name only indirectly
         # (the S1 branch inherits it); every published model used resnet50.
         encoder_name=ck.get("s1_encoder_name") or "resnet50",
