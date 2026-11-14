@@ -17,8 +17,11 @@ The network returns a logit map; the caller applies a sigmoid and multiplies by
 Module/attribute names (``backbones``, ``fusion``, ``reg_head``, ``inc``,
 ``downs`` ...) are kept identical to the original research code so that
 checkpoints trained with it load unchanged (see ``config_from_checkpoint``).
-Checkpoints whose S2 branch is the smp U-Net (``config["s2_arch"] == "unet"``,
-which includes every checkpoint of the research code) are rebuilt with it.
+Checkpoints whose S2 branch is the smp U-Net (``config["s2_arch"] == "unet"``)
+are rebuilt with it. For checkpoints of the research code the S2 branch is
+read from the weights: those trained before November 2026 have the smp U-Net
+(there ``--arch BPATUNet`` silently fell back to it in fusion mode), later ones
+the BPAT-UNet.
 """
 import numpy as np
 import segmentation_models_pytorch as smp
@@ -384,6 +387,18 @@ def build_model(config, pretrained=False):
                              config.get("align_mode", "bilinear"))
 
 
+def s2_arch_from_state_dict(state_dict):
+    """``"bpatunet"`` or ``"unet"``, from the parameter names of the S2 branch
+    (``backbones.0``) in a state dict."""
+    keys = [k[7:] if k.startswith("module.") else k for k in state_dict]
+    if any(k.startswith(("backbones.0.band_adapt.", "backbones.0.boundary_enhance_")) for k in keys):
+        return "bpatunet"
+    if any(k.startswith("backbones.0.encoder.") for k in keys):
+        return "unet"
+    raise ValueError("cannot tell the S2 branch from the checkpoint weights "
+                     "(no 'backbones.0.band_adapt'/'boundary_enhance' nor 'backbones.0.encoder')")
+
+
 def config_from_checkpoint(ck):
     """Return the model/normalisation config stored in a checkpoint.
 
@@ -414,10 +429,16 @@ def config_from_checkpoint(ck):
         ))
     chm_max = ck["max_chm_value"]
     chm_max = float(chm_max[0] if isinstance(chm_max, (list, tuple)) else chm_max)
+    # The S2 branch is read from the weights, not from the stored "arch": before
+    # November 2026 the research code stored "BPATUNet" but, in fusion mode,
+    # built an smp U-Net; since then it builds the real BPAT-UNet.
+    s2_arch = s2_arch_from_state_dict(ck["state_dict"])
+    s2_base = 64
+    if s2_arch == "bpatunet":
+        s2_base = int(ck["state_dict"]["backbones.0.inc.double_conv.0.weight"].shape[0])
     return dict(
-        # in fusion mode the research code always built the S2 branch as an
-        # smp U-Net ("--arch BPATUNet" fell back to it)
-        s2_arch="unet",
+        s2_arch=s2_arch,
+        s2_base_channels=s2_base,
         # the legacy checkpoint stores the S2 encoder name only indirectly
         # (the S1 branch inherits it); every published model used resnet50.
         encoder_name=ck.get("s1_encoder_name") or "resnet50",
