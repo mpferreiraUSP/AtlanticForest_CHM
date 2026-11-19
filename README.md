@@ -202,12 +202,14 @@ model, config, _ = load_model("runs/s2_s1_alos_dem/best.pth", "cuda")
 If you use this code, please cite:
 
 ```bibtex
-@article{ferreira_chm_multisensor,
-  title   = {<paper title>},
-  author  = {Ferreira, Matheus P. and ...},
-  journal = {<journal>},
-  year    = {<year>},
-  doi     = {<doi>}
+@misc{ferreira2026walltowallmapscanopyheight,
+      title={Wall-to-wall maps of canopy height and aboveground carbon across the Atlantic Forest}, 
+      author={Matheus Pinheiro Ferreira and Thiago Carmuega Rabaçal and Giulio Brossi Santoro and Giovanna de Andrade Ferreira and Rodrigo Costa Pinto and Danilo R. A. de Almeida and Paulo Guilherme Molin and Catherine Torres de Almeida and Angélica F. Resende and Vinicius Castro Souza and Marcelo Antonio Pinho Ferreira and Cássio Toledo and Eben North Broadbent and Angelica Almeyda Zambrano and Laura Simões and Juliano van Melis and Ricardo Ribeiro Rodrigues and Pedro H. S. Brancalion},
+      year={2026},
+      eprint={2611.23048},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2611.23048}, 
 }
 ```
 
