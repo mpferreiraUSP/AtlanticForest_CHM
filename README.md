@@ -215,7 +215,7 @@ If you use this code, please cite:
 
 ## License
 
-<add a license, e.g. MIT or Apache-2.0>
+CC BY 4.0
 
 ## Contact
 
